@@ -1,0 +1,827 @@
+#!/usr/bin/env python
+# coding: utf-8
+
+# # Python Analyse Bachelorarbeit: Fernerkundungsbasierte Analyse der Veränderungen der Waldgrenze vor dem Hintergrund des Klimawandels
+
+# ## Validierung
+
+# ### Berechnung der AOC-Kurve und Youden's Index
+
+# In[135]:
+
+
+import numpy as np
+from sklearn.metrics import roc_curve, roc_auc_score, accuracy_score, mean_squared_error
+import matplotlib.pyplot as plt
+from osgeo import gdal
+from joblib import Parallel, delayed
+
+# Function to load raster using gdal
+def load_raster_gdal(filepath):
+    dataset = gdal.Open(filepath)
+    if not dataset:
+        raise FileNotFoundError(f"Unable to open {filepath}")
+    band = dataset.GetRasterBand(1)
+    data = band.ReadAsArray()
+    print(f'Loaded raster {filepath} with shape {data.shape}')
+    return data
+
+reference_atei = load_raster_gdal('C:/Users/emile/Desktop/Bachelorarbeit/Daten/reference_atei_final_b0.tif')
+reference_raster = load_raster_gdal('C:/Users/emile/Desktop/Bachelorarbeit/Daten/reference_raster.tif')
+
+# Remove NaNs while keeping the spatial structure
+mask = ~np.isnan(reference_atei) & ~np.isnan(reference_raster)
+x = reference_atei[mask]
+y = reference_raster[mask]
+
+# Compute ROC curve and ROC area for the entire dataset
+fpr, tpr, thresholds = roc_curve(y, x)  # Directly use x if already in [0, 1]
+roc_auc = roc_auc_score(y, x)
+
+plt.figure()
+plt.plot(fpr, tpr, color='darkorange', lw=2, label=f'ROC Curve (AUC = {roc_auc:.2f})')
+plt.plot([0, 1], [0, 1], color='navy', lw=2, linestyle='--')
+plt.xlim([0.0, 1.0])
+plt.ylim([0.0, 1.05])
+plt.xlabel('False Positive Rate')
+plt.ylabel('True Positive Rate')
+plt.title('Receiver Operating Characteristic')
+plt.legend(loc="lower right")
+plt.show()
+
+# Calculate Youden's index
+youden_index = tpr - fpr
+optimal_threshold_index = np.argmax(youden_index)
+
+# Use the threshold corresponding to the maximum Youden's Index
+optimal_threshold = thresholds[optimal_threshold_index]
+
+print(f'Maximum Youden\'s Index: {youden_index[optimal_threshold_index]}')
+print(f'Optimal Threshold: {optimal_threshold}')
+
+# Binarize the reference_atei based on the optimal threshold
+binarized_reference_atei = (reference_atei >= optimal_threshold).astype(int)
+
+
+# ### 100-fache 10-geteilte k-means Validierung 
+
+# In[94]:
+
+
+import numpy as np
+from sklearn.metrics import accuracy_score, mean_squared_error
+from osgeo import gdal
+from joblib import Parallel, delayed
+
+def spatial_kfold_split(raster, n_splits=10):
+    rows, cols = raster.shape
+    row_block_size = rows // n_splits + (rows % n_splits > 0)
+    col_block_size = cols // n_splits + (cols % n_splits > 0)
+
+    for i in range(n_splits):
+        for j in range(n_splits):
+            test_mask = np.zeros_like(raster, dtype=bool)
+            test_mask[i * row_block_size: min((i + 1) * row_block_size, rows),
+                      j * col_block_size: min((j + 1) * col_block_size, cols)] = True
+
+            train_mask = ~test_mask
+
+            yield train_mask, test_mask
+
+def process_fold(train_mask, test_mask, binarized_reference_atei, reference_raster):
+    # Combine the test_mask with valid_mask to ensure no NaN values
+    valid_mask = ~np.isnan(reference_raster) & test_mask
+    
+    # Extract the test data
+    x_test = binarized_reference_atei[valid_mask]
+    y_test = reference_raster[valid_mask]
+
+    # Ensure that there's at least one sample in the test data
+    if len(x_test) == 0 or len(y_test) == 0:
+        return None, None
+
+    # Skip processing if the test data has no variability (e.g., all 0s or all 1s)
+    if len(np.unique(y_test)) == 1:
+        return None, None
+
+    # Calculate the binary predictions
+    y_pred = (x_test >= 0.5).astype(int)
+
+    # Calculate accuracy and RMSE
+    accuracy = accuracy_score(y_test, y_pred)
+    rmse = mean_squared_error(y_test, y_pred, squared=False)
+    
+    return accuracy, rmse
+
+# Initialize lists to store metrics
+accuracies = []
+rmses = []
+
+n_splits = 10
+n_repeats = 100
+n_jobs = -1  # Use all available cores
+
+for repeat in range(n_repeats):
+    print(f'Repetition {repeat + 1}/{n_repeats}')
+    
+    results = Parallel(n_jobs=n_jobs)(delayed(process_fold)(train_mask, test_mask, binarized_reference_atei, reference_raster)
+                                      for train_mask, test_mask in spatial_kfold_split(binarized_reference_atei, n_splits=n_splits))
+
+    # Filter out None results
+    for accuracy, rmse in results:
+        if accuracy is not None and rmse is not None:
+            accuracies.append(accuracy)
+            rmses.append(rmse)
+
+# Compute average metrics across all repeats and folds
+average_accuracy = np.mean(accuracies)
+average_rmse = np.mean(rmses)
+
+print(f'Average Accuracy: {average_accuracy}')
+print(f'Average RMSE: {average_rmse}')
+
+
+# ### Darstellung Validierung
+
+# In[88]:
+
+
+import numpy as np
+import rasterio
+import matplotlib.pyplot as plt
+import seaborn as sns
+import pandas as pd
+
+# Flatten the arrays and remove NaNs
+atei_values = reference_atei.flatten()
+raster_values = reference_raster.flatten()
+
+mask = ~np.isnan(atei_values) & ~np.isnan(raster_values)
+atei_values = atei_values[mask]
+raster_values = raster_values[mask]
+
+# Create a DataFrame for seaborn
+data = pd.DataFrame({
+    'ATEI': atei_values,
+    'Classification': raster_values
+})
+
+# Plot violin plot
+plt.figure(figsize=(10, 6))
+sns.violinplot(x='Classification', y='ATEI', data=data, palette={0: "red", 1: "blue"})
+
+# Add horizontal lines
+line2 = plt.axhline(y=np.mean(atei_values[raster_values == 0]), color='red', linestyle='--', linewidth=2, label='Mittelwert (Außerhalb)')
+line1 = plt.axhline(y=optimal_threshold, color='lime', linestyle='--', linewidth=2, label='Schwellenwert')
+line3 = plt.axhline(y=np.mean(atei_values[raster_values == 1]), color='blue', linestyle='--', linewidth=2, label='Mittelwert (Innerhalb)')
+
+# Set labels and title
+plt.xlabel('Pixel Klassifikation')
+plt.ylabel('Baumgrenzen-Ökotone-Index')
+plt.title('Geigen-Plot der Baumgrenzen-Ökoton-Index kategorisiert')
+plt.xticks([1, 0], ['Innerhalb der Baumgrenzen-Ökotone', 'Außerhalb der Baumgrenzen-Ökotone'])
+
+# Add legend inside the plot in the upper middle
+plt.legend(handles=[line1, line2, line3], loc='upper center', bbox_to_anchor=(0.5, 1), ncol=1)
+
+# Show plot
+plt.show()
+
+
+# ### Datendarstellung der ATEI in der Validierungsperiode 2021-2022
+
+# In[29]:
+
+
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+import dask.dataframe as dd
+
+# Load CSV file
+df = pd.read_csv('C:/Users/emile/Desktop/Bachelorarbeit/Daten/Mean_Elevation_Export_Landsat7_04.csv')  
+
+# Print column names to inspect them
+print(df.columns)
+
+# Calculate summary statistics
+summary_stats = df['DEM'].describe()
+print(summary_stats)
+
+
+# In[31]:
+
+
+# Create  boxplot of the elevation data
+plt.figure(figsize=(10, 6))
+plt.boxplot(df['DEM'], vert=True, patch_artist=True)
+plt.title('Boxplot: Verteilung der Höhe von Pixeln über Klassifizierungsschwellenwert')
+plt.ylabel('Höhe (m.ü.A)')
+plt.grid(True)
+
+# Show plot
+plt.show()
+
+
+# In[33]:
+
+
+# Create figure and axis
+plt.figure(figsize=(12, 8))
+
+# Create a boxplot with seaborn
+sns.boxplot(x=df['DEM'], color="skyblue")
+
+# Overlay jittered data points
+sns.stripplot(x=df['DEM'], color="blue", alpha=0.3, jitter=True)
+
+# Enhance the plot with additional features
+plt.title('Höhe der Pixeln mit ATEI >= 0.5')
+plt.xlabel('Höhe (m.ü.A.)')
+plt.grid(True)
+
+# Show the plot
+plt.show()
+
+
+# In[34]:
+
+
+import matplotlib.pyplot as plt
+import seaborn as sns
+import numpy as np
+
+# Create a histogram
+plt.figure(figsize=(12, 8))
+sns.histplot(df['DEM'], bins=30, kde=True, color="skyblue")
+plt.title('Histogramm: Verteilung der Höhe von Pixeln über Klassifizierungsschwellenwert')
+plt.xlabel('Höhe (m.ü.A.)')
+plt.ylabel('Häufigkeit der Pixel')
+plt.grid(True)
+
+# Set x-axis ticks to start at a rounded value and increment by 100, rotating labels by 45 degrees
+start = (df['DEM'].min() // 100) * 100  # Round down to the nearest 100
+end = ((df['DEM'].max() // 100) + 1) * 100  # Round up to the nearest 100
+plt.xticks(np.arange(start, end, 100), rotation=45)
+
+# Show the plot
+plt.show()
+
+
+# ### Analyse und Darstellung der mittleren jährlichen Temperatur 1999-2023 (Landsat 7-Oberflächentemperatur)
+
+# In[89]:
+
+
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+from scipy.stats import linregress
+
+# Load the CSV file
+df = pd.read_csv('C:/Users/emile/Desktop/Bachelorarbeit/Daten/Mean_Std_Temperature_1999_2023_smoothed_Landsat7.csv')
+
+# Filter the data to separate 'mean' and 'std' types
+mean_data = df[df['type'] == 'mean']
+std_data = df[df['type'] == 'std']
+
+# Ensure that the years match between mean and std datasets
+mean_data.rename(columns={'year': 'Year'}, inplace=True)
+std_data.rename(columns={'year': 'Year'}, inplace=True)
+
+# Merge mean and std datasets on 'Year', using a left join to keep all years from mean_data
+combined_df = pd.merge(mean_data[['Year', 'mean']], std_data[['Year', 'mean']], on='Year', suffixes=('_mean', '_std'), how='left')
+
+# Drop the year 2001 (outlier) from the DataFrame 
+combined_df = combined_df[combined_df['Year'] != 2001]
+
+# Print the means and standard deviations with corresponding years
+print("Yearly Means and Standard Deviations:")
+for index, row in combined_df.iterrows():
+    print(f"Year: {row['Year']}, Mean: {row['mean_mean']}, StdDev: {row['mean_std']}")
+
+# Perform linear regression on the mean values
+slope, intercept, r_value, p_value, std_err = linregress(combined_df['Year'], combined_df['mean_mean'])
+r_squared = r_value**2
+
+# Print the slope and R^2 value
+print(f'\nSteigung Regressionsgerade: {slope}')
+print(f'Bestimmtheitsmaß (R²): {r_squared}')
+
+# Plot the data and regression line with error bars
+plt.figure(figsize=(10, 6))
+sns.regplot(
+    data=combined_df, 
+    x='Year', 
+    y='mean_mean', 
+    marker='o', 
+    scatter_kws={'s':50, 'color':'#4d4d4d'},  # Change point color to dark grey
+    line_kws={'color':'red', 'linestyle':'--'}
+)
+
+# Add error bars manually
+plt.errorbar(combined_df['Year'], combined_df['mean_mean'], yerr=combined_df['mean_std'], fmt='o', color='#4d4d4d', capsize=5)
+
+# Rotate x-axis labels for better readability
+plt.xticks(rotation=45)
+
+plt.title('Mittlere Temperatur gegen Jahre (1999-2023)')
+plt.xlabel('Jahr')
+plt.ylabel('Mittlere Temperatur in [°C]')
+plt.grid(True)
+plt.xticks(combined_df['Year'])  # Keep the x-ticks aligned with the years
+plt.legend(['Regressionslinie', 'Mittlere Temperatur (mit Verteilung)'])  # Adjust legend
+plt.tight_layout()  # Adjust layout to prevent clipping of labels
+plt.show()
+
+
+# ### Analyse und Darstellung der 5-Jahres-Mitteltemperaturen von 1999 bis 2023 (Landsat 7-Oberflächentemperatur)
+
+# In[92]:
+
+
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+from scipy.stats import linregress
+
+# Load the CSV file
+df = pd.read_csv('C:/Users/emile/Desktop/Bachelorarbeit/Daten/Mean_Std_Temperature_1999_2023_smoothed_Landsat7.csv')
+
+# Filter the data to separate 'mean' and 'std' types
+mean_data = df[df['type'] == 'mean']
+std_data = df[df['type'] == 'std']
+
+# Ensure that the years match between mean and std datasets
+mean_data.rename(columns={'year': 'Year'}, inplace=True)
+std_data.rename(columns={'year': 'Year'}, inplace=True)
+
+# Merge mean and std datasets on 'Year', using a left join to keep all years from mean_data
+combined_df = pd.merge(mean_data[['Year', 'mean']], std_data[['Year', 'mean']], on='Year', suffixes=('_mean', '_std'), how='left')
+
+# Drop the year 2001 (outlier) from the DataFrame 
+combined_df = combined_df[combined_df['Year'] != 2001]
+
+# Calculate 5-year rolling mean and standard deviation
+combined_df['RollingMean'] = combined_df['mean_mean'].rolling(window=5).mean()
+combined_df['RollingStdDev'] = combined_df['mean_std'].rolling(window=5).std()
+
+# Remove the initial NaN values that result from rolling calculation
+combined_df = combined_df.dropna()
+
+# Print the 5-year rolling means with corresponding years
+print("5-Year Rolling Means and Standard Deviations:")
+for index, row in combined_df.iterrows():
+    print(f"Year: {row['Year']}, Rolling Mean: {row['RollingMean']}, Rolling StdDev: {row['RollingStdDev']}")
+
+# Perform linear regression on the rolling mean values
+slope, intercept, r_value, p_value, std_err = linregress(combined_df['Year'], combined_df['RollingMean'])
+r_squared = r_value**2
+
+# Print the slope and R^2 value
+print(f'\nSteigung Regressionsgerade: {slope}')
+print(f'Bestimmtheitsmaß (R²): {r_squared}')
+
+# Plot the 5-year rolling means with error bars and the regression line
+plt.figure(figsize=(10, 6))
+sns.regplot(
+    data=combined_df, 
+    x='Year', 
+    y='RollingMean', 
+    marker='o', 
+    scatter_kws={'s':50, 'color':'#4d4d4d'},  # Change point color to dark grey
+    line_kws={'color':'red', 'linestyle':'--'}
+)
+
+# Add error bars manually for the rolling mean and standard deviation
+plt.errorbar(combined_df['Year'], combined_df['RollingMean'], yerr=combined_df['RollingStdDev'], fmt='o', color='#4d4d4d', capsize=5)
+
+# Rotate x-axis labels for better readability
+plt.xticks(rotation=45)
+
+plt.title('5-Year Rolling Mean of Mittlere Temperatur gegen Jahre (1999-2023)')
+plt.xlabel('Jahr')
+plt.ylabel('5-Year Rolling Mean of Mittlere Temperatur in [°C]')
+plt.grid(True)
+plt.xticks(combined_df['Year'])  # Keep the x-ticks aligned with the years
+plt.legend(['Regressionslinie', '5-Year Rolling Mean of Mittlere Temperatur (mit Verteilung)'])  # Adjust legend
+plt.tight_layout()  # Adjust layout to prevent clipping of labels
+plt.show()
+
+
+# ### Analyse und Darstellungen der ATEI-Durchschnitte von 1999-2023 (Landsat 7)
+
+# In[139]:
+
+
+import glob
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+from scipy.stats import linregress
+import numpy as np
+
+# Specify the path to your CSV files
+csv_files = glob.glob('C:/Users/emile/Desktop/Bachelorarbeit/Daten/Mean_Elevation_Export_smoothed_Landsat7_4/*.csv')
+
+# Initialize lists to store the means and standard deviations
+means = []
+std_devs = []
+
+# Column name for which you want to calculate the mean
+column_name = 'DEM'
+
+# Base year
+start_year = 1999
+
+# Loop through the CSV files and calculate the mean and standard deviation for the specified column
+for file in csv_files:
+    df = pd.read_csv(file)
+    mean_value = df[column_name].mean()
+    std_dev_value = df[column_name].std()  # Calculate standard deviation
+    means.append(mean_value)
+    std_devs.append(std_dev_value)
+
+# Create a DataFrame to hold the means, standard deviations, and corresponding years
+years = list(range(start_year, start_year + len(means)))
+means_df = pd.DataFrame({'Year': years, 'Mean': means, 'StdDev': std_devs})
+
+# Print the means with corresponding years
+print("Yearly Means of the DEM column:")
+for index, row in means_df.iterrows():
+    print(f"Year: {row['Year']}, Mean: {row['Mean']}, StdDev: {row['StdDev']}")
+
+# Calculate the whole mean and standard deviation
+whole_mean = np.mean(means)
+whole_std_dev = np.sqrt(np.mean(np.array(std_devs)**2))
+
+print(f"\nWhole Mean of the yearly means: {whole_mean}")
+print(f"Whole Standard Deviation of the yearly means: {whole_std_dev}")
+
+# Calculate the linear regression
+slope, intercept, r_value, p_value, std_err = linregress(means_df['Year'], means_df['Mean'])
+r_squared = r_value**2
+
+# Print the slope and R^2 value
+print(f'\nSteigung Regressionsgerade: {slope}')
+print(f'Bestimmtheitsmaß (R²): {r_squared}')
+
+# Plot the data and regression line with error bars
+plt.figure(figsize=(10, 6))
+sns.regplot(
+    data=means_df, 
+    x='Year', 
+    y='Mean', 
+    marker='o', 
+    scatter_kws={'s':50, 'color':'#4d4d4d'},  # Change point color to dark grey
+    line_kws={'color':'red', 'linestyle':'--'}
+)
+
+# Add error bars manually
+plt.errorbar(means_df['Year'], means_df['Mean'], yerr=means_df['StdDev'], fmt='o', color='#4d4d4d', capsize=5)
+
+plt.title('Mittlere Höhe der Baumgrenzen-Ökotone zwischen 2014 und 2023')
+plt.xlabel('Jahr')
+plt.ylabel('Mittlere Höhe der Baumgrenzen-Ökotone (m.ü.a)')
+plt.grid(True)
+plt.xticks(means_df['Year'], rotation=45)  # Rotate the x-ticks by 45 degrees
+plt.legend(['Mittlere Baumgrenzen-Ökotone (mit Verteilung)', 'Regressionslinie'])  # Adjust legend
+plt.show()
+
+
+# ### Analyse und Darstellungen der 5-Jahres-ATEI-Durchschnitte von 1999-2023 (Landsat 7)
+
+# In[149]:
+
+
+import glob
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+from scipy.stats import linregress
+
+# Specify the path to your CSV files
+csv_files = glob.glob('C:/Users/emile/Desktop/Bachelorarbeit/Daten/Mean_Elevation_Export_smoothed_Landsat7_4/*.csv')
+
+# Initialize lists to store the means and standard deviations
+means = []
+std_devs = []
+all_data = []  # List to store all data for the overall mean and std dev
+
+# Column name for which you want to calculate the mean
+column_name = 'DEM'
+
+# Base year
+start_year = 1999
+
+# Loop through the CSV files and calculate the mean and standard deviation for the specified column
+for file in csv_files:
+    df = pd.read_csv(file)
+    all_data.extend(df[column_name].dropna().tolist())  # Append non-NaN values to the list
+    mean_value = df[column_name].mean()
+    std_dev_value = df[column_name].std()  # Calculate standard deviation
+    means.append(mean_value)
+    std_devs.append(std_dev_value)
+
+# Calculate the overall mean and standard deviation
+overall_mean = pd.Series(all_data).mean()
+overall_std_dev = pd.Series(all_data).std()
+
+print(f'Overall Mean of DEM: {overall_mean}')
+print(f'Overall Standard Deviation of DEM: {overall_std_dev}')
+
+# Create a DataFrame to hold the means, standard deviations, and corresponding years
+years = list(range(start_year, start_year + len(means)))
+means_df = pd.DataFrame({'Year': years, 'Mean': means, 'StdDev': std_devs})
+
+# Calculate 5-year rolling mean and standard deviation
+means_df['RollingMean_treeline'] = means_df['Mean'].rolling(window=5).mean()
+means_df['RollingStdDev'] = means_df['StdDev'].rolling(window=5).std()
+
+# Remove the initial NaN values that result from rolling calculation
+means_df = means_df.dropna()
+
+# Print the 5-year rolling means with corresponding years
+print("5-Year Rolling Means of the DEM column:")
+for index, row in means_df.iterrows():
+    print(f"Year: {row['Year']}, Rolling Mean: {row['RollingMean_treeline']}, Rolling StdDev: {row['RollingStdDev']}")
+
+# Calculate the linear regression on the 5-year rolling means
+slope, intercept, r_value, p_value, std_err = linregress(means_df['Year'], means_df['RollingMean_treeline'])
+r_squared = r_value**2
+
+# Print the slope, R² value, and p-value
+print(f'\nSteigung Regressionsgerade: {slope}')
+print(f'Bestimmtheitsmaß (R²): {r_squared}')
+print(f'P-Wert: {p_value}')
+
+# Check for significance (p < 0.05)
+if p_value < 0.01:
+    print("Die Ergebnisse sind statistisch signifikant (p < 0,01).")
+else:
+    print("Die Ergebnisse sind nicht statistisch signifikant (p >= 0,01).")
+
+# Plot the 5-year rolling means with error bars and the regression line
+plt.figure(figsize=(10, 6))
+sns.regplot(
+    data=means_df, 
+    x='Year', 
+    y='RollingMean_treeline', 
+    marker='o', 
+    scatter_kws={'s':50, 'color':'#4d4d4d'},  # Change point color to dark grey
+    line_kws={'color':'red', 'linestyle':'--'}
+)
+
+# Add error bars manually for the rolling mean and standard deviation
+plt.errorbar(means_df['Year'], means_df['RollingMean_treeline'], yerr=means_df['RollingStdDev'], fmt='o', color='#4d4d4d', capsize=5)
+
+plt.title('5-jähriger gleitender Mittelwert der mittleren Höhe der Baumgrenzen-Ökotone')
+plt.xlabel('Jahr')
+plt.ylabel('Mittleren Höhe der Baumgrenzen-Ökotone (m.ü.A.)')
+plt.grid(True)
+plt.xticks(means_df['Year'], rotation=45)  # Rotate the x-ticks by 45 degrees
+plt.legend(['5-jähriger gleitender Mittelwert (mit Verteilung)', 'Regressionslinie'])  # Adjust legend
+plt.show()
+
+
+# ### Analyse und Darstellung der mittleren jährlichen Temperatur (1999-2023)
+
+# In[152]:
+
+
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+# Load the CSV file
+df = pd.read_csv('C:/Users/emile/Desktop/Bachelorarbeit/Daten/Mean_Std_Temperature_1999_2023_ERA5.csv')
+
+# Filter the data to separate 'mean' and 'std' types
+mean_data = df[df['type'] == 'mean']
+std_data = df[df['type'] == 'std']
+
+# Ensure that the years match between mean and std datasets
+mean_data.rename(columns={'year': 'Year'}, inplace=True)
+std_data.rename(columns={'year': 'Year'}, inplace=True)
+
+# Merge mean and std datasets on 'Year', using a left join to keep all years from mean_data
+combined_df = pd.merge(mean_data[['Year', 'mean']], std_data[['Year', 'mean']], on='Year', suffixes=('_mean', '_std'), how='left')
+
+# Calculate the overall mean and standard deviation for the 'mean_mean' column
+overall_mean = combined_df['mean_mean'].mean()
+overall_std_dev = combined_df['mean_mean'].std()
+
+print(f'Overall Mean of Mean Temperature: {overall_mean}')
+print(f'Overall Standard Deviation of Mean Temperature: {overall_std_dev}')
+
+# Print the means and standard deviations with corresponding years
+print("\nMeans and Standard Deviations:")
+for index, row in combined_df.iterrows():
+    print(f"Year: {row['Year']}, Mean: {row['mean_mean']}, StdDev: {row['mean_std']}")
+
+# Plot the means with error bars
+plt.figure(figsize=(10, 6))
+
+# Plot all points and error bars
+for index, row in combined_df.iterrows():
+    if row['Year'] == 2001:
+        # Special color for the year 2001
+        plt.errorbar(row['Year'], row['mean_mean'], yerr=row['mean_std'], fmt='o', color='red', capsize=5, label='2001' if index == 0 else "")
+    else:
+        # Default color for all other years
+        plt.errorbar(row['Year'], row['mean_mean'], yerr=row['mean_std'], fmt='o', color='#4d4d4d', capsize=5)
+
+# Rotate x-axis labels for better readability
+plt.xticks(rotation=45)
+
+plt.title('Mittlere Temperatur gegen Jahre (1999-2023)')
+plt.xlabel('Jahr')
+plt.ylabel('Mittlere Temperatur mit Verteilung in [°C]')
+plt.grid(True)
+plt.xticks(combined_df['Year'])  # Keep the x-ticks aligned with the years
+
+# Adjust layout and display the plot
+plt.tight_layout()
+plt.legend()
+plt.show()
+
+
+# ### Analyse und Darstellung der 5-Jahres-Mitteltemperaturen von 1999 bis 2023 (Lufttemperatur)
+
+# In[161]:
+
+
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+from scipy.stats import linregress
+
+# Load the CSV file
+df = pd.read_csv('C:/Users/emile/Desktop/Bachelorarbeit/Daten/Mean_Std_Temperature_1999_2023_ERA5.csv')
+
+# Filter the data to separate 'mean' and 'std' types
+mean_data = df[df['type'] == 'mean']
+std_data = df[df['type'] == 'std']
+
+# Ensure that the years match between mean and std datasets
+mean_data.rename(columns={'year': 'Year'}, inplace=True)
+std_data.rename(columns={'year': 'Year'}, inplace=True)
+
+# Merge mean and std datasets on 'Year', using a left join to keep all years from mean_data
+temp_df = pd.merge(mean_data[['Year', 'mean']], std_data[['Year', 'mean']], on='Year', suffixes=('_mean', '_std'), how='left')
+
+# Drop the year 2001 (outlier) from the DataFrame 
+#temp_df = temp_df[temp_df['Year'] != 2001]
+
+# Calculate the overall mean and standard deviation for the entire dataset
+overall_mean = temp_df['mean_mean'].mean()
+overall_std_dev = temp_df['mean_mean'].std()
+
+print(f'Overall Mean of Mean Temperature: {overall_mean}')
+print(f'Overall Standard Deviation of Mean Temperature: {overall_std_dev}')
+
+# Calculate 5-year rolling mean and standard deviation
+temp_df['RollingMean_temp'] = temp_df['mean_mean'].rolling(window=5).mean()
+temp_df['RollingStdDev'] = temp_df['mean_std'].rolling(window=5).std()
+
+# Remove the initial NaN values that result from rolling calculation
+means_temp = temp_df.dropna()
+
+# Print the 5-year rolling means with corresponding years
+print("5-Year Rolling Means and Standard Deviations:")
+for index, row in means_temp.iterrows():
+    print(f"Year: {row['Year']}, Rolling Mean: {row['RollingMean_temp']}, Rolling StdDev: {row['RollingStdDev']}")
+
+# Perform linear regression on the rolling mean values
+slope, intercept, r_value, p_value, std_err = linregress(means_temp['Year'], means_temp['RollingMean_temp'])
+r_squared = r_value**2
+
+# Print the slope, R² value, and p-value
+print(f'\nSteigung Regressionsgerade: {slope}')
+print(f'Bestimmtheitsmaß (R²): {r_squared}')
+print(f'P-Wert: {p_value}')
+
+# Check for significance (p < 0.05)
+if p_value < 0.01:
+    print("Die Ergebnisse sind statistisch signifikant (p < 0,01).")
+else:
+    print("Die Ergebnisse sind nicht statistisch signifikant (p >= 0,01).")
+
+# Plot the 5-year rolling means with error bars and the regression line
+plt.figure(figsize=(10, 6))
+sns.regplot(
+    data=means_temp, 
+    x='Year', 
+    y='RollingMean_temp', 
+    marker='o', 
+    scatter_kws={'s':50, 'color':'#4d4d4d'},  # Change point color to dark grey
+    line_kws={'color':'red', 'linestyle':'--'}
+)
+
+# Add error bars manually for the rolling mean and standard deviation
+plt.errorbar(means_temp['Year'], means_temp['RollingMean_temp'], yerr=means_temp['RollingStdDev'], fmt='o', color='#4d4d4d', capsize=5)
+
+# Rotate x-axis labels for better readability
+plt.xticks(rotation=45)
+
+plt.title('5-jähriger gleitender Mittelwert der Mittleren Temperatur (1999-2023)')
+plt.xlabel('Jahr')
+plt.ylabel('Mittelwert der Temperatur in [°C]')
+plt.grid(True)
+plt.xticks(means_temp['Year'])  # Keep the x-ticks aligned with the years
+plt.legend(['5-jähriger gleitender Mittelwert der Mittleren Temperaturen (mit Verteilung)', 'Regressionslinie'])  # Adjust legend
+plt.tight_layout()  # Adjust layout to prevent clipping of labels
+plt.show()
+
+
+# In[155]:
+
+
+print(means_df.columns)
+print(temp_df.columns)
+
+
+# ### Analyse der Wechselwirkung zwischen Baumgrenzen-Ökotone und Temperatur
+
+# In[171]:
+
+
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+from sklearn.linear_model import LinearRegression
+from scipy.stats import linregress
+import numpy as np
+
+# Merging data
+combined_df = pd.merge(temp_df, means_df, on='Year', how='left')
+
+# Drop rows where RollingMean_temp or RollingMean_treeline is NaN
+combined_df = combined_df.dropna(subset=['RollingMean_temp', 'RollingMean_treeline'])
+
+# Perform regression analysis using LinearRegression
+x = combined_df['RollingMean_temp'].values.reshape(-1, 1)
+y = combined_df['RollingMean_treeline'].values
+model = LinearRegression().fit(x, y)
+
+# Extract slope (coefficient) and intercept
+slope = model.coef_[0]
+intercept = model.intercept_
+r_squared = model.score(x, y)
+
+# Calculate p-value and standard error using scipy's linregress
+slope_scipy, intercept_scipy, r_value, p_value, std_err = linregress(
+    combined_df['RollingMean_temp'], combined_df['RollingMean_treeline']
+)
+
+# Print regression results
+print(f'\nSteigung Regressionsgerade: {slope}')
+print(f'Bestimmtheitsmaß (R²): {r_squared}')
+print(f'P-Wert: {p_value}')
+
+# Check for significance (p < 0.05)
+if p_value < 0.01:
+    print("Die Ergebnisse sind statistisch signifikant (p < 0,01).")
+else:
+    print("Die Ergebnisse sind nicht statistisch signifikant (p >= 0,01).")
+
+# Plot with confidence interval cloud (default behavior of sns.regplot)
+plt.figure(figsize=(10, 6))
+
+# Use sns.regplot to plot with confidence interval cloud (ci is by default set to 95% CI)
+sns.regplot(
+    data=combined_df, 
+    x='RollingMean_temp', 
+    y='RollingMean_treeline', 
+    marker='o', 
+    scatter_kws={'s':50, 'color':'#4d4d4d'},  # Set scatter points to dark grey
+    line_kws={'color':'red', 'linestyle':'--'},  # Red dashed regression line
+    ci=95  # Default confidence interval is 95%
+)
+
+# Add labels for each data point
+for i, row in combined_df.iterrows():
+    plt.text(
+        row['RollingMean_temp'], 
+        row['RollingMean_treeline'], 
+        str(int(row['Year'])),  # Convert year to integer to remove decimals
+        fontsize=10,  # Slightly larger font size
+        ha='right', 
+        va='bottom', 
+        color='#4d4d4d'  # Match the color of the data points
+    )
+
+# Title and labels
+plt.title('Mittlere Höhe der Alpinen Baumgrenzen-Ökotone gegen mittlere Temperatur Juni-September (2004-2023)')
+plt.xlabel('Mittelwert der Mittleren Temperaturen in [°C]')
+plt.ylabel('Mittelwert der mittleren Höhe der Baumgrenzen-Ökotone (m.ü.A.)')
+plt.grid(True)
+
+# Legend (adjusted as per your naming conventions)
+plt.legend(['Jahre', 'Regressionslinie'])
+
+# Adjust layout
+plt.tight_layout()  # Prevent clipping of labels
+
+# Display plot
+plt.show()
